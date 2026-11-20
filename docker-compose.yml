@@ -1,0 +1,78 @@
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: upgrade-gateway:local
+    ports:
+      - "8000:8000"
+    environment:
+      PRIMARY_URL: http://primary-mirror:8000
+      BACKUP_URL: http://backup-mirror:8000
+      MIRROR_CONNECT_TIMEOUT: "2"
+      MIRROR_READ_TIMEOUT: "10"
+    depends_on:
+      primary-mirror:
+        condition: service_healthy
+      backup-mirror:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  primary-mirror:
+    build:
+      context: .
+      dockerfile: Dockerfile.mirror
+    image: upgrade-mirror:local
+    environment:
+      MIRROR_ROLE: primary
+      MIRROR_DATA_DIR: /data
+      # Optional boot-time fault: MIRROR_FAULT_MODE=none|truncate|corrupt
+      MIRROR_FAULT_MODE: ${PRIMARY_FAULT_MODE:-none}
+      MIRROR_FAULT_FROM_CHUNK: ${PRIMARY_FAULT_FROM_CHUNK:-1}
+    volumes:
+      - ./data/primary:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  backup-mirror:
+    build:
+      context: .
+      dockerfile: Dockerfile.mirror
+    image: upgrade-mirror:local
+    environment:
+      MIRROR_ROLE: backup
+      MIRROR_DATA_DIR: /data
+      MIRROR_FAULT_MODE: ${BACKUP_FAULT_MODE:-none}
+      MIRROR_FAULT_FROM_CHUNK: ${BACKUP_FAULT_FROM_CHUNK:-1}
+    volumes:
+      - ./data/backup:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped

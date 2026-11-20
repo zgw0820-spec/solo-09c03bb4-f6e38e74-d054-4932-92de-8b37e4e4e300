@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>升级包下载网关</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main>
+    <header>
+      <h1>升级包下载网关</h1>
+      <p class="sub">分块 Range 拉取 · 逐块 64 KiB 校验 · 主镜像失败自动切备用镜像</p>
+    </header>
+
+    <section class="card" id="package-card">
+      <h2>升级包</h2>
+      <p class="muted" id="package-name">正在读取清单…</p>
+      <dl class="facts">
+        <div><dt>版本</dt><dd id="pkg-version">—</dd></div>
+        <div><dt>大小</dt><dd id="pkg-size">—</dd></div>
+        <div><dt>分块</dt><dd id="pkg-chunks">—</dd></div>
+        <div><dt>SHA-256</dt><dd><code id="pkg-sha" class="mono">—</code></dd></div>
+      </dl>
+      <div class="actions">
+        <a class="button primary" id="download-link" href="#" download>下载升级包</a>
+        <button class="button" id="verify-button" type="button">下载并校验</button>
+      </div>
+      <p class="hint">「下载」交给浏览器保存；「下载并校验」在页面里逐字节收完并核对总 SHA-256。</p>
+    </section>
+
+    <section class="card">
+      <h2>镜像状态与故障注入</h2>
+      <p class="muted">故障从指定分块起生效：<code>truncate</code> 只发半个块就断流，<code>corrupt</code> 返回等长但摘要错误的块。</p>
+      <div class="mirror-grid" id="mirror-grid"></div>
+      <button class="button" id="refresh-mirrors" type="button">刷新镜像状态</button>
+    </section>
+
+    <section class="card">
+      <h2>下载进度</h2>
+      <div class="bar"><div class="bar-fill" id="bar-fill"></div></div>
+      <p class="muted" id="progress-text">尚未开始。</p>
+      <dl class="facts">
+        <div><dt>已收字节</dt><dd id="stat-bytes">0</dd></div>
+        <div><dt>已收块数</dt><dd id="stat-blocks">0</dd></div>
+        <div><dt>耗时</dt><dd id="stat-elapsed">—</dd></div>
+        <div><dt>结果</dt><dd id="stat-result">—</dd></div>
+      </dl>
+      <p class="mono small" id="stat-error"></p>
+    </section>
+
+    <section class="card">
+      <h2>网关统计</h2>
+      <pre id="stats" class="mono small">—</pre>
+      <button class="button" id="refresh-stats" type="button">刷新统计</button>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>
