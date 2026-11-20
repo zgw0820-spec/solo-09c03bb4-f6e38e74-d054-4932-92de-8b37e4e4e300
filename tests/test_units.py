@@ -13,6 +13,7 @@ from app.artifact import (
     load_manifest,
     package_bytes,
 )
+from app.gateway import SEGMENT_CHUNKS, build_segments
 from app.ranges import RangeError, parse_range
 
 
@@ -95,3 +96,33 @@ def test_parse_range_rejects_invalid_ranges(header):
 
 def test_parse_range_without_header():
     assert parse_range(None, 100) is None
+
+
+def test_build_segments_merges_adjacent_chunks():
+    manifest = load_manifest(MANIFEST_PATH)
+    segments = build_segments(manifest, SEGMENT_CHUNKS)
+    # 97 chunks merged by 4 -> 25 segments, i.e. 25 Range requests per download.
+    assert len(segments) == 25
+    assert all(len(segment.chunks) == SEGMENT_CHUNKS for segment in segments[:-1])
+    assert len(segments[-1].chunks) == 1
+
+    # Segments tile the package contiguously and match the manifest ranges.
+    assert segments[0].start == 0
+    assert segments[-1].end == manifest.size - 1
+    for previous, following in zip(segments, segments[1:]):
+        assert following.start == previous.end + 1
+    for segment in segments:
+        assert segment.length == sum(chunk.length for chunk in segment.chunks)
+        assert segment.start == segment.chunks[0].offset
+        last = segment.chunks[-1]
+        assert segment.end == last.offset + last.length - 1
+
+
+def test_build_segments_of_one_mirrors_plain_chunks():
+    manifest = load_manifest(MANIFEST_PATH)
+    segments = build_segments(manifest, 1)
+    assert len(segments) == manifest.chunk_count
+    for segment, chunk in zip(segments, manifest.chunks):
+        assert segment.chunks == (chunk,)
+        assert segment.start == chunk.offset
+        assert segment.length == chunk.length

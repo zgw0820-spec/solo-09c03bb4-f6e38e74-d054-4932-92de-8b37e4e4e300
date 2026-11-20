@@ -1,17 +1,22 @@
-"""Chunk-verified resumable download gateway.
+"""Chunk-verified resumable download gateway with merged range reads.
 
-For every 64 KiB chunk in the built-in manifest the gateway issues a strict
-HTTP Range request to the primary mirror, verifies the returned range, length
-and SHA-256, and only then releases the block to the client. If the primary
-mirror drops the stream, returns a different range, or serves a block whose
-digest does not match, the whole block is fetched again from the backup
-mirror. A block that neither mirror can deliver correctly aborts the
-download. The response declares the full package length up front, so an
-aborted stream is observably shorter than declared and the client can
-recognise the failure.
+Adjacent 64 KiB chunks are merged into multi-block segments: one HTTP Range
+request to the primary mirror fetches up to ``SEGMENT_CHUNKS`` blocks, so a
+healthy primary serves the whole 97-block package in 25 requests. As the
+segment body streams in, each block is checked against the manifest (range,
+length and SHA-256) and released to the client in order, without waiting for
+the rest of the segment to arrive.
 
-At most two blocks are buffered per download inside the gateway: the block
-currently being written to the client and at most one prefetched block.
+If the merged response drops mid-stream or a block fails verification, the
+verified prefix is kept and the remainder of that segment is fetched block by
+block under the original primary->backup fallback rule. A block that neither
+mirror can deliver correctly aborts the download; the response declares the
+full package length up front, so an aborted stream is observably shorter than
+declared and the client can recognise the failure.
+
+At most two blocks are buffered per download inside the gateway — the block
+being received and the block being sent both count — and when the client goes
+away mid-download the in-flight mirror response is closed.
 """
 
 from __future__ import annotations
@@ -23,7 +28,7 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -40,6 +45,8 @@ logger = logging.getLogger("gateway")
 MAX_BUFFERED_BLOCKS = 2
 MAX_FALLBACK_DETAIL = 8
 MIRROR_ROLES = ("primary", "backup")
+# Merge factor: ceil(97 chunks / 4) = 25 mirror Range requests per download.
+SEGMENT_CHUNKS = 4
 STATIC_DIR = Path(__file__).with_name("static")
 
 
@@ -84,6 +91,9 @@ class Counters:
     chunks_backup: int = 0
     primary_errors: int = 0
     backup_errors: int = 0
+    range_requests_primary: int = 0
+    range_requests_backup: int = 0
+    mirror_streams_open: int = 0
     last_error: str | None = None
     last_download: dict | None = None
 
@@ -96,6 +106,7 @@ class Settings:
     connect_timeout: float
     read_timeout: float
     first_byte_timeout: float
+    segment_chunks: int = SEGMENT_CHUNKS
 
     @property
     def mirror_urls(self) -> dict[str, str]:
@@ -117,12 +128,80 @@ def settings_from_env(manifest: Manifest | None = None) -> Settings:
         first_byte_timeout=env_float(
             "FIRST_BYTE_TIMEOUT", 2 * (connect + read) + 2.0
         ),
+        segment_chunks=max(1, int(os.environ.get("SEGMENT_CHUNKS", str(SEGMENT_CHUNKS)))),
     )
+
+
+@dataclass(frozen=True)
+class Segment:
+    """A run of consecutive manifest chunks fetched with one Range request."""
+
+    chunks: tuple[Chunk, ...]
+
+    @property
+    def start(self) -> int:
+        return self.chunks[0].offset
+
+    @property
+    def end(self) -> int:
+        """Inclusive offset of the last byte in the segment."""
+        last = self.chunks[-1]
+        return last.offset + last.length - 1
+
+    @property
+    def length(self) -> int:
+        return self.end - self.start + 1
+
+    @property
+    def label(self) -> str:
+        return f"{self.chunks[0].index}..{self.chunks[-1].index}"
+
+
+def build_segments(manifest: Manifest, segment_chunks: int) -> list[Segment]:
+    """Group adjacent manifest chunks into merge-read segments."""
+    size = max(1, segment_chunks)
+    return [
+        Segment(tuple(manifest.chunks[i : i + size]))
+        for i in range(0, len(manifest.chunks), size)
+    ]
+
+
+@dataclass
+class MirrorMetrics:
+    """Per-download Range-request counters plus process-wide gauges."""
+
+    counters: Counters
+    requests: dict[str, int] = field(
+        default_factory=lambda: {"primary": 0, "backup": 0}
+    )
+
+    def count_request(self, mirror: str) -> None:
+        self.requests[mirror] += 1
+        if mirror == "primary":
+            self.counters.range_requests_primary += 1
+        else:
+            self.counters.range_requests_backup += 1
+
+    @asynccontextmanager
+    async def stream(self, client: httpx.AsyncClient, url: str, headers: dict):
+        """Open one mirror response and track it until it is closed.
+
+        The gauge drops back to zero only after the response (and its
+        connection, when the body was not fully consumed) has been closed,
+        which is what a cancelled download relies on.
+        """
+        self.counters.mirror_streams_open += 1
+        try:
+            async with client.stream("GET", url, headers=headers) as response:
+                yield response
+        finally:
+            self.counters.mirror_streams_open -= 1
 
 
 async def fetch_chunk(
     client: httpx.AsyncClient,
     settings: Settings,
+    metrics: MirrorMetrics,
     mirror: str,
     chunk: Chunk,
 ) -> bytes:
@@ -133,9 +212,10 @@ async def fetch_chunk(
     expected_range = f"bytes {chunk.offset}-{range_end}/{manifest.size}"
 
     try:
-        async with client.stream(
-            "GET", url, headers={"Range": f"bytes={chunk.offset}-{range_end}"}
+        async with metrics.stream(
+            client, url, headers={"Range": f"bytes={chunk.offset}-{range_end}"}
         ) as response:
+            metrics.count_request(mirror)
             if response.status_code != 206:
                 raise ChunkError("bad_status", f"HTTP {response.status_code}")
             content_range = response.headers.get("content-range")
@@ -169,14 +249,15 @@ async def fetch_chunk(
 async def fetch_chunk_with_fallback(
     client: httpx.AsyncClient,
     settings: Settings,
-    counters: Counters,
+    metrics: MirrorMetrics,
     chunk: Chunk,
 ) -> tuple[bytes, str, list[str]]:
     """Fetch one block; on any primary failure, refetch the block from backup."""
+    counters = metrics.counters
     rejected: list[str] = []
     for mirror in MIRROR_ROLES:
         try:
-            data = await fetch_chunk(client, settings, mirror, chunk)
+            data = await fetch_chunk(client, settings, metrics, mirror, chunk)
         except ChunkError as exc:
             rejected.append(f"{mirror}:{exc.reason}")
             if mirror == "primary":
@@ -204,6 +285,52 @@ async def fetch_chunk_with_fallback(
     )
 
 
+class _SegmentReader:
+    """Reads exact block-sized pieces from one streaming mirror response.
+
+    httpx re-chunks the body to at most ``CHUNK_SIZE`` bytes per piece and the
+    reader only ever keeps the remainder of the block currently being
+    received, so the block under assembly is the only application-layer
+    buffer here.
+    """
+
+    def __init__(self, response: httpx.Response):
+        self._pieces = response.aiter_bytes(chunk_size=CHUNK_SIZE)
+        self._buffer = bytearray()
+        self.received = 0
+
+    async def read_block(self, length: int) -> bytes:
+        """Return exactly ``length`` bytes or raise ``ChunkError``."""
+        while len(self._buffer) < length:
+            try:
+                piece = await self._pieces.__anext__()
+            except StopAsyncIteration:
+                raise ChunkError(
+                    "short_body",
+                    f"segment body ended after {self.received} bytes",
+                ) from None
+            except (httpx.HTTPError, OSError) as exc:
+                raise ChunkError("transport", f"{type(exc).__name__}: {exc}") from exc
+            self._buffer.extend(piece)
+            self.received += len(piece)
+        data = bytes(self._buffer[:length])
+        del self._buffer[:length]
+        return data
+
+    async def expect_end(self) -> None:
+        """Fail if the mirror sent more bytes than the requested segment."""
+        try:
+            async for piece in self._pieces:
+                if piece:
+                    raise ChunkError(
+                        "length_mismatch", "body longer than the requested segment"
+                    )
+        except (httpx.HTTPError, OSError) as exc:
+            raise ChunkError("transport", f"{type(exc).__name__}: {exc}") from exc
+        if self._buffer:
+            raise ChunkError("length_mismatch", "trailing bytes after last block")
+
+
 @dataclass
 class _Block:
     chunk: Chunk
@@ -219,10 +346,11 @@ class _End:
 class ChunkPipeline:
     """Bounded producer/consumer holding at most two blocks per download.
 
-    A slot is taken before a block is requested and returned only once the
+    The producer merges adjacent chunks into one Range request per segment.
+    A slot is taken before a block is received and returned only once the
     ASGI server has accepted that block for writing to the client, so the
     gateway never buffers more than ``MAX_BUFFERED_BLOCKS`` blocks for one
-    download.
+    download — including the block being received and the one being sent.
     """
 
     def __init__(
@@ -243,10 +371,15 @@ class ChunkPipeline:
         self._resident = 0
         self.max_resident = 0
         self.sources = {"primary": 0, "backup": 0}
+        self.metrics = MirrorMetrics(counters)
         self.fallbacks: list[dict] = []
         self.fallback_count = 0
         self._fallback_recorded = 0
+        self.segment_fallbacks: list[dict] = []
+        self.segment_fallback_count = 0
+        self._segment_fallback_recorded = 0
         self.sent = 0
+        self._segments = build_segments(settings.manifest, settings.segment_chunks)
 
     def start(self) -> None:
         self._task = asyncio.create_task(
@@ -257,39 +390,143 @@ class ChunkPipeline:
         self._resident -= 1
         self._slots.release()
 
+    async def _stream_segment(self, segment: Segment) -> int | None:
+        """Stream one merged segment from the primary mirror.
+
+        Every verified block is queued for the client as soon as its digest
+        passes, without waiting for the rest of the segment. Returns ``None``
+        when the whole segment verified, otherwise the index of the first
+        block that still needs trustworthy bytes.
+        """
+        manifest = self._settings.manifest
+        url = f"{self._settings.primary_url}/files/{manifest.name}"
+        expected_range = f"bytes {segment.start}-{segment.end}/{manifest.size}"
+        failed_at: int | None = None
+        try:
+            async with self.metrics.stream(
+                self._client,
+                url,
+                headers={"Range": f"bytes={segment.start}-{segment.end}"},
+            ) as response:
+                self.metrics.count_request("primary")
+                if response.status_code != 206:
+                    raise ChunkError("bad_status", f"HTTP {response.status_code}")
+                content_range = response.headers.get("content-range")
+                if content_range != expected_range:
+                    raise ChunkError(
+                        "range_mismatch", f"{content_range!r} != {expected_range!r}"
+                    )
+                declared = response.headers.get("content-length")
+                if declared is not None and int(declared) != segment.length:
+                    raise ChunkError(
+                        "length_mismatch",
+                        f"Content-Length {declared} != {segment.length}",
+                    )
+
+                reader = _SegmentReader(response)
+                for chunk in segment.chunks:
+                    failed_at = chunk.index
+                    await self._slots.acquire()
+                    self._resident += 1
+                    self.max_resident = max(self.max_resident, self._resident)
+                    try:
+                        data = await reader.read_block(chunk.length)
+                    except (ChunkError, asyncio.CancelledError):
+                        self._release_slot()
+                        raise
+                    if hashlib.sha256(data).hexdigest() != chunk.sha256:
+                        self._release_slot()
+                        raise ChunkError("digest_mismatch", f"chunk {chunk.index}")
+                    self.sources["primary"] += 1
+                    self._counters.chunks_primary += 1
+                    await self._queue.put(_Block(chunk, data, "primary"))
+                try:
+                    await reader.expect_end()
+                except ChunkError as exc:
+                    # Every block in the segment already verified, so the
+                    # bytes are trusted; the talkative mirror is only noted.
+                    self._counters.primary_errors += 1
+                    logger.warning("segment %s trailing-data check: %s", segment.label, exc)
+                return None
+        except ChunkError as exc:
+            reason, detail = exc.reason, exc.detail
+        except (httpx.HTTPError, OSError) as exc:
+            reason, detail = "transport", f"{type(exc).__name__}: {exc}"
+
+        # The verified prefix stays; only the unverified tail is refetched.
+        resume = failed_at if failed_at is not None else segment.chunks[0].index
+        self._counters.primary_errors += 1
+        self.segment_fallback_count += 1
+        if self._segment_fallback_recorded < MAX_FALLBACK_DETAIL:
+            self._segment_fallback_recorded += 1
+            self.segment_fallbacks.append(
+                {
+                    "segment": segment.label,
+                    "rejected": f"primary:{reason}" + (f" ({detail})" if detail else ""),
+                    "resume_chunk": resume,
+                }
+            )
+        logger.warning(
+            "segment %s rejected from primary (%s%s); refilling from chunk %d",
+            segment.label,
+            reason,
+            f": {detail}" if detail else "",
+            resume,
+        )
+        return resume
+
+    async def _refill(self, segment: Segment, resume: int) -> None:
+        """Fetch the unverified tail of a failed segment block by block."""
+        for chunk in segment.chunks:
+            if chunk.index < resume:
+                continue
+            await self._slots.acquire()
+            self._resident += 1
+            self.max_resident = max(self.max_resident, self._resident)
+            try:
+                data, mirror, rejected = await fetch_chunk_with_fallback(
+                    self._client, self._settings, self.metrics, chunk
+                )
+            except (asyncio.CancelledError, DownloadAborted):
+                self._release_slot()
+                raise
+            except Exception as exc:  # defensive: never wedge a download
+                self._release_slot()
+                raise DownloadAborted(
+                    f"internal error on chunk {chunk.index}: {exc!r}"
+                ) from exc
+            if rejected:
+                self.fallback_count += 1
+                if self._fallback_recorded < MAX_FALLBACK_DETAIL:
+                    self._fallback_recorded += 1
+                    self.fallbacks.append(
+                        {"chunk": chunk.index, "rejected": rejected, "served_by": mirror}
+                    )
+            self.sources[mirror] += 1
+            await self._queue.put(_Block(chunk, data, mirror))
+
     async def _produce(self) -> None:
         error: DownloadAborted | None = None
         try:
-            for chunk in self._settings.manifest.chunks:
-                await self._slots.acquire()
-                self._resident += 1
-                self.max_resident = max(self.max_resident, self._resident)
+            for segment in self._segments:
                 try:
-                    data, mirror, rejected = await fetch_chunk_with_fallback(
-                        self._client, self._settings, self._counters, chunk
-                    )
+                    resume = await self._stream_segment(segment)
                 except asyncio.CancelledError:
-                    self._release_slot()
+                    raise
+                except Exception as exc:  # defensive: never wedge a download
+                    error = DownloadAborted(
+                        f"internal error in segment {segment.label}: {exc!r}"
+                    )
+                    break
+                if resume is None:
+                    continue
+                try:
+                    await self._refill(segment, resume)
+                except asyncio.CancelledError:
                     raise
                 except DownloadAborted as exc:
-                    self._release_slot()
                     error = exc
                     break
-                except Exception as exc:  # defensive: never wedge a download
-                    self._release_slot()
-                    error = DownloadAborted(
-                        f"internal error on chunk {chunk.index}: {exc!r}"
-                    )
-                    break
-                if rejected:
-                    self.fallback_count += 1
-                    if self._fallback_recorded < MAX_FALLBACK_DETAIL:
-                        self._fallback_recorded += 1
-                        self.fallbacks.append(
-                            {"chunk": chunk.index, "rejected": rejected, "served_by": mirror}
-                        )
-                self.sources[mirror] += 1
-                await self._queue.put(_Block(chunk, data, mirror))
         finally:
             self._queue.put_nowait(_End(error))
 
@@ -310,6 +547,17 @@ class ChunkPipeline:
     def release(self, block: _Block) -> None:
         self._release_slot()
 
+    def stats(self) -> dict:
+        return {
+            "requests": dict(self.metrics.requests),
+            "sources": dict(self.sources),
+            "fallback_count": self.fallback_count,
+            "fallbacks": list(self.fallbacks),
+            "segment_fallback_count": self.segment_fallback_count,
+            "segment_fallbacks": list(self.segment_fallbacks),
+            "max_resident_blocks": self.max_resident,
+        }
+
     async def close(self) -> None:
         if self._closed:
             return
@@ -318,7 +566,8 @@ class ChunkPipeline:
             self._task.cancel()
         if self._task is not None:
             # Always await so a cancelled or failed producer is reaped instead
-            # of leaking an unretrieved-exception warning.
+            # of leaking an unretrieved-exception warning. Cancelling the
+            # producer also closes any mirror response it was reading.
             try:
                 await self._task
             except (asyncio.CancelledError, Exception):
@@ -349,10 +598,11 @@ def create_app(
             follow_redirects=False,
         )
         logger.info(
-            "gateway manifest=%s size=%d chunks=%d primary=%s backup=%s",
+            "gateway manifest=%s size=%d chunks=%d segment_chunks=%d primary=%s backup=%s",
             manifest.name,
             manifest.size,
             manifest.chunk_count,
+            settings.segment_chunks,
             settings.primary_url,
             settings.backup_url,
         )
@@ -373,6 +623,7 @@ def create_app(
             "X-Package-Sha256": manifest.sha256,
             "X-Chunk-Size": str(CHUNK_SIZE),
             "X-Chunk-Count": str(manifest.chunk_count),
+            "X-Segment-Chunks": str(settings.segment_chunks),
             "X-Download-Id": download_id,
         }
 
@@ -386,10 +637,7 @@ def create_app(
             "outcome": "failed",
             "received": pipeline.sent,
             "expected": manifest.size,
-            "sources": dict(pipeline.sources),
-            "fallback_count": pipeline.fallback_count,
-            "fallbacks": list(pipeline.fallbacks),
-            "max_resident_blocks": pipeline.max_resident,
+            **pipeline.stats(),
             "error": str(error),
             "at": time.time(),
         }
@@ -457,21 +705,21 @@ def create_app(
                     "outcome": "completed",
                     "received": pipeline.sent,
                     "expected": manifest.size,
-                    "sources": dict(pipeline.sources),
-                    "fallback_count": pipeline.fallback_count,
-                    "fallbacks": list(pipeline.fallbacks),
-                    "max_resident_blocks": pipeline.max_resident,
+                    **pipeline.stats(),
                     "elapsed_ms": round((time.monotonic() - started_at) * 1000, 1),
                     "at": time.time(),
                 }
                 logger.info(
                     "download %s complete: %d bytes, primary=%d backup=%d, "
-                    "fallbacks=%d, max_buffered=%d",
+                    "requests=%d/%d, fallbacks=%d, segment_fallbacks=%d, max_buffered=%d",
                     download_id,
                     pipeline.sent,
                     pipeline.sources["primary"],
                     pipeline.sources["backup"],
+                    pipeline.metrics.requests["primary"],
+                    pipeline.metrics.requests["backup"],
                     pipeline.fallback_count,
+                    pipeline.segment_fallback_count,
                     pipeline.max_resident,
                 )
             except DownloadAborted as exc:
@@ -517,6 +765,7 @@ def create_app(
             "sha256": manifest.sha256,
             "chunk_size": manifest.chunk_size,
             "chunk_count": manifest.chunk_count,
+            "segment_chunks": settings.segment_chunks,
             "max_buffered_blocks": MAX_BUFFERED_BLOCKS,
             "download_path": f"/download/{manifest.name}",
         }
@@ -535,6 +784,11 @@ def create_app(
                 "primary_errors": counters.primary_errors,
                 "backup_errors": counters.backup_errors,
             },
+            "range_requests": {
+                "primary": counters.range_requests_primary,
+                "backup": counters.range_requests_backup,
+            },
+            "mirror_streams_open": counters.mirror_streams_open,
             "last_error": counters.last_error,
             "last_download": counters.last_download,
         }
@@ -569,6 +823,7 @@ def create_app(
             "mirrors": [await mirror_state(request, role) for role in MIRROR_ROLES],
             "chunk_size": manifest.chunk_size,
             "chunk_count": manifest.chunk_count,
+            "segment_chunks": settings.segment_chunks,
             "max_buffered_blocks": MAX_BUFFERED_BLOCKS,
         }
 

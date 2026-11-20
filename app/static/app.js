@@ -42,7 +42,10 @@ async function loadManifest() {
   el("pkg-version").textContent = manifest.version;
   el("pkg-size").textContent = formatBytes(manifest.size);
   el("pkg-chunks").textContent =
-    `${manifest.chunk_count} 块 × ${manifest.chunk_size / 1024} KiB（末块较短）`;
+    `${manifest.chunk_count} 块 × ${manifest.chunk_size / 1024} KiB（末块较短）` +
+    (manifest.segment_chunks
+      ? `，每 ${manifest.segment_chunks} 块合并为 1 次 Range 请求`
+      : "");
   el("pkg-sha").textContent = manifest.sha256;
   el("download-link").href = manifest.download_path;
   el("download-link").setAttribute("download", manifest.name);
@@ -129,6 +132,17 @@ async function loadStats() {
     const response = await fetch("/api/stats", { cache: "no-store" });
     const stats = await response.json();
     el("stats").textContent = JSON.stringify(stats, null, 2);
+    const last = stats.last_download;
+    if (last && last.requests) {
+      el("stat-requests").textContent =
+        `最近一次下载（${last.outcome === "completed" ? "成功" : "失败"}）Range 请求：` +
+        `主镜像 ${last.requests.primary} 次 · 备用镜像 ${last.requests.backup} 次` +
+        (last.segment_fallback_count
+          ? `，合并段回退逐块补齐 ${last.segment_fallback_count} 段`
+          : "");
+    } else {
+      el("stat-requests").textContent = "尚无下载记录。";
+    }
   } catch (error) {
     el("stats").textContent = `读取统计失败：${error}`;
   }

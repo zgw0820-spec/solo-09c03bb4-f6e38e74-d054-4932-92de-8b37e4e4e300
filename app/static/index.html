@@ -10,7 +10,7 @@
   <main>
     <header>
       <h1>升级包下载网关</h1>
-      <p class="sub">分块 Range 拉取 · 逐块 64 KiB 校验 · 主镜像失败自动切备用镜像</p>
+      <p class="sub">相邻块合并 Range 拉取（整包 ≤ 25 次请求） · 逐块 64 KiB 校验 · 主镜像失败自动切备用镜像</p>
     </header>
 
     <section class="card" id="package-card">
@@ -51,6 +51,7 @@
 
     <section class="card">
       <h2>网关统计</h2>
+      <p class="muted small" id="stat-requests">尚无下载记录。</p>
       <pre id="stats" class="mono small">—</pre>
       <button class="button" id="refresh-stats" type="button">刷新统计</button>
     </section>

@@ -78,6 +78,7 @@ async def run_stack(tmp_path: Path, primary_offline: bool = False):
         connect_timeout=2.0,
         read_timeout=10.0,
         first_byte_timeout=6.0,
+        segment_chunks=4,
     )
     gateway = RunningServer(gateway_module.create_app(settings), gateway_port)
 
@@ -94,6 +95,7 @@ async def run_stack(tmp_path: Path, primary_offline: bool = False):
                 "gateway": f"http://127.0.0.1:{gateway_port}",
                 "primary_server": primary,
                 "manifest": MANIFEST,
+                "settings": settings,
             }
     finally:
         await gateway.stop()

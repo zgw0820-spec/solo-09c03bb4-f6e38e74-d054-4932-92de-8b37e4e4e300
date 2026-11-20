@@ -11,6 +11,9 @@ services:
       BACKUP_URL: http://backup-mirror:8000
       MIRROR_CONNECT_TIMEOUT: "2"
       MIRROR_READ_TIMEOUT: "10"
+      # Merge factor for adjacent chunks: ceil(97 / 4) = 25 Range requests
+      # per full download while the primary mirror is healthy.
+      SEGMENT_CHUNKS: "4"
     depends_on:
       primary-mirror:
         condition: service_healthy

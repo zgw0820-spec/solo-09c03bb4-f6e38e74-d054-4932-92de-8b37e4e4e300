@@ -113,6 +113,18 @@ def main() -> int:
         if not ok:
             failures += 1
 
+    def report_line(label: str, ok: bool, detail: str) -> None:
+        nonlocal failures
+        print(f"[{'PASS' if ok else 'FAIL'}] {label}: {detail}")
+        if not ok:
+            failures += 1
+
+    def last_download() -> dict:
+        code, body = request("GET", base + "/api/stats")
+        if code != 200:
+            return {}
+        return json.loads(body).get("last_download") or {}
+
     def exact(result: dict) -> bool:
         return (
             result["status"] == 200
@@ -125,6 +137,16 @@ def main() -> int:
     clear("backup")
 
     report("baseline", exact(result := download(base)), result)
+    merged = manifest["chunk_count"] // manifest.get("segment_chunks", 4) + (
+        1 if manifest["chunk_count"] % manifest.get("segment_chunks", 4) else 0
+    )
+    requests = (last_download().get("requests") or {})
+    report_line(
+        "baseline used merged range requests",
+        requests.get("primary") == merged and requests.get("backup") == 0,
+        f"primary={requests.get('primary')} backup={requests.get('backup')} "
+        f"(expected primary={merged} backup=0)",
+    )
 
     set_fault("primary", "corrupt", 2)
     report("primary corrupt blocks -> backup", exact(result := download(base)), result)
@@ -151,8 +173,10 @@ def main() -> int:
             "last completed download:",
             json.dumps(
                 {
+                    "requests": last.get("requests"),
                     "sources": last["sources"],
                     "fallback_count": last["fallback_count"],
+                    "segment_fallback_count": last.get("segment_fallback_count"),
                     "max_resident_blocks": last["max_resident_blocks"],
                     "elapsed_ms": last["elapsed_ms"],
                 },

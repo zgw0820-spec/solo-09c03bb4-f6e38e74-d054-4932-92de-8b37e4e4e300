@@ -112,7 +112,8 @@ async def test_gateway_rejects_mirror_with_wrong_range_or_length(tmp_path):
             assert sha256(response.content) == MANIFEST.sha256
             stats = (await client.get(f"http://127.0.0.1:{gateway_port}/api/stats")).json()
             assert stats["chunks"]["backup"] == MANIFEST.chunk_count
-            assert stats["chunks"]["primary_errors"] == MANIFEST.chunk_count
+            # 25 merged segment requests plus 97 single-block retries, all lied about.
+            assert stats["chunks"]["primary_errors"] == 25 + MANIFEST.chunk_count
             assert stats["last_download"]["outcome"] == "completed"
     finally:
         await gateway.stop()
